@@ -288,6 +288,20 @@ export function scanMcpServer(resolved) {
   return { score: computeScore(issues), issues }
 }
 
+// Scan an MCP server entry as it will be written to agent config, for paths
+// that have no resolved source to inspect (e.g. `profile apply`). The command
+// line is joined so a pattern split across `args` is still matched, and the
+// whole entry is included so fields such as `env` or `url` are covered too.
+export function scanMcpServerConfig(name, serverConfig) {
+  if (!serverConfig || typeof serverConfig !== 'object') {
+    return { score: 100, issues: [] }
+  }
+  const args = Array.isArray(serverConfig.args) ? serverConfig.args : []
+  const commandLine = [serverConfig.command ?? '', ...args].join(' ')
+  const content = `${commandLine}\n${JSON.stringify(serverConfig)}`
+  return scanMcpServer({ fileContents: { [name]: content } })
+}
+
 export function formatSecurityReport({ score, issues }, skillName) {
   const label = classifyScore(score)
   const emoji = label === 'safe' ? '✅' : label === 'review' ? '⚠️' : '❌'

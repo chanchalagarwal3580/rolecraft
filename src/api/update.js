@@ -1,15 +1,15 @@
 import { existsSync } from 'node:fs'
-import { join } from 'node:path'
-import {
-  readLock,
-  getProjectLockPath,
-  normalizeSlug,
-  findActualSlug,
-} from '../utils/lockfile.js'
-import { resolveSource } from '../utils/resolver.js'
-import { installSkill } from '../utils/installer.js'
+import { isAbsolute, join, resolve } from 'node:path'
 import agents from '../agents.js'
 import { UserError } from '../utils/errors.js'
+import { installSkill } from '../utils/installer.js'
+import {
+  findActualSlug,
+  getProjectLockPath,
+  normalizeSlug,
+  readLock,
+} from '../utils/lockfile.js'
+import { resolveSource } from '../utils/resolver.js'
 
 function detectTargets(slug, cwd) {
   const normSlug = normalizeSlug(slug)
@@ -59,8 +59,16 @@ export async function apiUpdate(slug, cwd = process.cwd(), options = {}) {
     return { dryRun: true, slug: actualSlug, source, sourceType, targets }
   }
 
-  const resolved = await resolveSource(source)
-  const results = await installSkill(resolved, targets)
+  const targetSource =
+    sourceType === 'local' || source.startsWith('.')
+      ? isAbsolute(source) || source.startsWith('~')
+        ? source
+        : resolve(cwd, source)
+      : source
+
+  const resolved = await resolveSource(targetSource)
+  resolved.sourcePath = source
+  const results = await installSkill(resolved, targets, 'copy', cwd)
 
   return { slug: actualSlug, source, sourceType, targets, results }
 }

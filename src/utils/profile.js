@@ -6,7 +6,7 @@ import { listMcpServers, addMcpServer } from './mcp.js'
 import { readLock, getGlobalLockPath, getProjectLockPath } from './lockfile.js'
 import { resolveSource } from './resolver.js'
 import { installSkill } from './installer.js'
-import { scanSkill, classifyScore } from './security.js'
+import { scanSkill, scanMcpServerConfig, classifyScore } from './security.js'
 import { detectAgents } from '../commands/setup.js'
 
 export { detectAgents }
@@ -418,7 +418,81 @@ export async function createBackup(agentFlag) {
   return results.length > 0 ? results : null
 }
 
-export async function applyAgentConfig(agentFlag, configData) {
+// Profiles can come from `profile import`, so every MCP server they carry
+// gets the same scan as skill-sourced ones before it reaches agent config.
+// Returns `{ allowed, level, reason }`; `reason` is set when blocked.
+function gateMcpServer(name, serverConfig, options = {}, where = '') {
+  const security = scanMcpServerConfig(name, serverConfig)
+  const level = classifyScore(security.score, security.issues)
+  const flagged = level === 'danger' || level === 'review'
+  const label = `MCP server "${name}"${where ? ` in ${where}` : ''}`
+  if (flagged && !options.yes) {
+    const issues = security.issues.filter((i) => i.severity !== 'low')
+    console.error(
+      `\n⚠️  ${label} blocked by security scan (score: ${security.score}/100). Review the profile, or re-run with --yes to apply it anyway.`,
+    )
+    for (const i of issues) console.error(`  [${i.severity}] ${i.description}`)
+    return {
+      allowed: false,
+      level,
+      reason: `security scan blocked (score: ${security.score}/100): ${issues
+        .map((i) => `[${i.severity}] ${i.description}`)
+        .join('; ')}`,
+    }
+  }
+  // --yes forces past the gate but never silently
+  if (flagged) {
+    console.error(
+      `\n⚠️  [${level.toUpperCase()}] --yes forcing ${label} despite security scan (score: ${security.score}/100).`,
+    )
+  }
+  return { allowed: true, level }
+}
+
+// Drop flagged MCP servers from one scope of a profile's `config` section.
+// For some agents (windsurf, continue) the config file is also the MCP config
+// file, so `mcpServers` here would otherwise bypass the gate in
+// `applyMcpServers`. Covers the object form (`mcpServers`) and continue's list
+// form (`experimental.mcpServers`). The profile data is not modified.
+function filterConfigMcpServers(scope, scopeData, options) {
+  if (!scopeData || typeof scopeData !== 'object' || Array.isArray(scopeData))
+    return { data: scopeData, blocked: [] }
+
+  const blocked = []
+  let data = scopeData
+
+  const servers = scopeData.mcpServers
+  if (servers && typeof servers === 'object' && !Array.isArray(servers)) {
+    const kept = {}
+    for (const [name, serverConfig] of Object.entries(servers)) {
+      const gate = gateMcpServer(name, serverConfig, options, `config.${scope}`)
+      if (gate.allowed) kept[name] = serverConfig
+      else blocked.push({ scope, name, reason: gate.reason })
+    }
+    if (blocked.length > 0) data = { ...data, mcpServers: kept }
+  }
+
+  const list = scopeData.experimental?.mcpServers
+  if (Array.isArray(list)) {
+    const before = blocked.length
+    const kept = list.filter((entry, index) => {
+      const name = entry?.name ?? String(index)
+      const gate = gateMcpServer(name, entry, options, `config.${scope}`)
+      if (!gate.allowed) blocked.push({ scope, name, reason: gate.reason })
+      return gate.allowed
+    })
+    if (blocked.length > before) {
+      data = {
+        ...data,
+        experimental: { ...data.experimental, mcpServers: kept },
+      }
+    }
+  }
+
+  return { data, blocked }
+}
+
+export async function applyAgentConfig(agentFlag, configData, options = {}) {
   const paths = AGENT_CONFIG_PATHS[agentFlag]
   if (!paths || !configData || typeof configData !== 'object') return []
 
@@ -427,24 +501,33 @@ export async function applyAgentConfig(agentFlag, configData) {
     const scopeData = configData[scope]
     if (scopeData === undefined || scopeData === null) continue
 
+    const { data, blocked } = filterConfigMcpServers(scope, scopeData, options)
     const targetPath = getPath()
     await mkdir(dirname(targetPath), { recursive: true })
-    await writeFile(
-      targetPath,
-      `${JSON.stringify(scopeData, null, 2)}\n`,
-      'utf-8',
-    )
-    results.push({ scope, path: targetPath })
+    await writeFile(targetPath, `${JSON.stringify(data, null, 2)}\n`, 'utf-8')
+    results.push({ scope, path: targetPath, blocked })
   }
 
   return results
 }
 
-export async function applyMcpServers(agentFlag, servers) {
+export async function applyMcpServers(agentFlag, servers, options = {}) {
   if (!servers || typeof servers !== 'object') return []
 
   const results = []
   for (const [name, serverConfig] of Object.entries(servers)) {
+    const gate = gateMcpServer(name, serverConfig, options)
+    if (!gate.allowed) {
+      results.push({
+        name,
+        success: false,
+        blocked: true,
+        level: gate.level,
+        reason: gate.reason,
+      })
+      continue
+    }
+
     try {
       const success = await addMcpServer(agentFlag, name, serverConfig)
       results.push({ name, success })
@@ -565,8 +648,8 @@ export async function applyInstructions(agentFlag, instructions) {
 export async function applyProfileEntry(agentFlag, entry, options = {}) {
   const result = {
     agent: agentFlag,
-    config: { applied: [], skipped: [] },
-    mcpServers: { applied: [], skipped: [] },
+    config: { applied: [], skipped: [], blocked: [] },
+    mcpServers: { applied: [], skipped: [], blocked: [] },
     skills: { applied: [], skipped: [], failed: [] },
     instructions: { applied: [], skipped: [] },
     backup: null,
@@ -576,16 +659,29 @@ export async function applyProfileEntry(agentFlag, entry, options = {}) {
 
   if (entry.config) {
     result.backup = await createBackup(agentFlag)
-    const configResult = await applyAgentConfig(agentFlag, entry.config)
-    result.config.applied = configResult
+    const configResult = await applyAgentConfig(
+      agentFlag,
+      entry.config,
+      options,
+    )
+    for (const { scope, path, blocked } of configResult) {
+      result.config.applied.push({ scope, path })
+      result.config.blocked.push(...blocked)
+    }
   } else {
     result.config.skipped.push('no config data in profile')
   }
 
   if (!options.skipMcp && entry.mcpServers) {
-    const mcpResult = await applyMcpServers(agentFlag, entry.mcpServers)
+    const mcpResult = await applyMcpServers(
+      agentFlag,
+      entry.mcpServers,
+      options,
+    )
     for (const r of mcpResult) {
       if (r.success) result.mcpServers.applied.push(r.name)
+      else if (r.blocked)
+        result.mcpServers.blocked.push({ name: r.name, reason: r.reason })
       else result.mcpServers.skipped.push(r.name)
     }
   } else {

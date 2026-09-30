@@ -105,4 +105,63 @@ describe('api verify', () => {
       { slug: 'owner/frozen', reason: 'missing source in lockfile' },
     ])
   })
+
+  // Distinct from the file name, so an assertion cannot pass just because the
+  // slug itself is echoed back in the failure entry.
+  const LEAK_MARKER = 'should-not-be-read-9f2c'
+
+  // A slug of ".." is the form that actually escapes: normalizeSlug turns "/"
+  // into "-", so "../../evil" collapses to "..-..-evil" and never leaves the
+  // skills directory, while ".." survives normalization and joins to the parent.
+  it('does not read outside the skills directory for a traversal slug', async () => {
+    const projectDir = join(tempDir, 'traversal-project')
+    const agentsDir = join(projectDir, '.agents')
+    await mkdir(join(agentsDir, 'skills'), { recursive: true })
+    // Reachable from the ".." slug, because verify reads files directly out of
+    // the directory it lands on rather than recursing.
+    await writeFile(join(agentsDir, 'SECRET.md'), LEAK_MARKER)
+    await writeLock(projectDir, {
+      '..': {
+        source: 'evil/repo',
+        agents: ['project'],
+        contentSha: 'deadbeef',
+      },
+    })
+
+    const result = await apiVerify(projectDir)
+
+    assert.equal(result.allPassed, false)
+    assert.equal(result.totalFailed, 1)
+    assert.equal(result.failed[0].slug, '..')
+    assert.match(result.failed[0].reason, /unsafe slug/)
+
+    // The guard is what matters, not just the wording: nothing outside the
+    // skills directory may appear anywhere in the result.
+    assert.equal(result.verified.length, 0)
+    assert.equal(JSON.stringify(result).includes(LEAK_MARKER), false)
+  })
+
+  // normalizeSlug does not touch a Windows separator, so this form would traverse
+  // there. It cannot fail on a POSIX runner, where "\" is an ordinary character
+  // in a file name, so this case is a guard for a Windows runner rather than
+  // current coverage — the matrix has none. It is here so that adding one does
+  // not mean writing this test from scratch.
+  it('does not read outside the skills directory for a backslash traversal slug', async () => {
+    const projectDir = join(tempDir, 'backslash-project')
+    const agentsDir = join(projectDir, '.agents')
+    await mkdir(join(agentsDir, 'skills'), { recursive: true })
+    await writeFile(join(agentsDir, 'SECRET.md'), LEAK_MARKER)
+    await writeLock(projectDir, {
+      '..\\SECRET.md': {
+        source: 'evil/repo',
+        agents: ['project'],
+        contentSha: 'deadbeef',
+      },
+    })
+
+    const result = await apiVerify(projectDir)
+
+    assert.equal(result.allPassed, false)
+    assert.equal(JSON.stringify(result).includes(LEAK_MARKER), false)
+  })
 })

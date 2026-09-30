@@ -140,6 +140,42 @@ describe('apiRollback', () => {
     assert.ok(result.targets.includes('cursor'))
   })
 
+  it('dry-run leaves the lockfile byte-identical', async () => {
+    const drySlug = 'dry-run-untouched'
+    await setupLockfile({
+      [drySlug]: {
+        slug: drySlug,
+        contentSha: 'current-sha',
+        fileHashes: { 'SKILL.md': 'current-hash' },
+        source: 'owner/repo@current',
+        agents: ['cursor'],
+        installedAt: '2026-09-01T00:00:00.000Z',
+        history: [
+          {
+            contentSha: 'older-sha',
+            fileHashes: { 'SKILL.md': 'older-hash' },
+            source: 'owner/repo@older',
+            installedAt: '2026-07-01T00:00:00.000Z',
+          },
+          {
+            contentSha: 'previous-sha',
+            fileHashes: { 'SKILL.md': 'previous-hash' },
+            source: 'owner/repo@previous',
+            installedAt: '2026-08-01T00:00:00.000Z',
+          },
+        ],
+      },
+    })
+    await setupBackup(drySlug, backupContent, 'backup-001')
+    const lockPath = join(tempDir, '.agents', '.skill-lock.json')
+    const before = await readFile(lockPath, 'utf-8')
+
+    const result = await rollbackModule.apiRollback(drySlug, { dryRun: true })
+
+    assert.equal(await readFile(lockPath, 'utf-8'), before)
+    assert.equal(result.prevContentSha, 'previous-sha')
+  })
+
   it('restores files from the most recent backup', async () => {
     // Set up a fresh skill with history + backup
     const freshSlug = 'fresh-rollback'
@@ -182,5 +218,49 @@ describe('apiRollback', () => {
     // Verify files were actually restored
     const restoredSkill = await readFile(join(agentDir, 'SKILL.md'), 'utf-8')
     assert.equal(restoredSkill, 'restored content')
+  })
+
+  it('restores agents recorded by name when their flag differs', async () => {
+    // The installer records agent names in the lockfile (claude-code,
+    // opencode, ...), while those agents' flags are claude, agents, ...
+    const { default: AGENTS, getAgentByFlag } = await import('../agents.js')
+    const renamed = AGENTS.filter((agent) => !getAgentByFlag(agent.name))
+    assert.ok(renamed.length > 0)
+    // Rollback replaces these directories, so keep them inside the test HOME.
+    for (const agent of renamed) {
+      assert.ok(agent.getDir().startsWith(tempDir), agent.getDir())
+    }
+
+    const namedSlug = 'named-rollback'
+    await setupLockfile({
+      [namedSlug]: {
+        slug: namedSlug,
+        contentSha: 'current',
+        agents: renamed.map((agent) => agent.name),
+        installedAt: new Date().toISOString(),
+        history: [
+          {
+            contentSha: 'prev',
+            fileHashes: { 'SKILL.md': 'old-hash' },
+            installedAt: '2026-07-01T00:00:00.000Z',
+          },
+        ],
+      },
+    })
+    await setupBackup(namedSlug, { 'SKILL.md': 'restored content' }, 'b-001')
+
+    const result = await rollbackModule.apiRollback(namedSlug)
+
+    assert.deepEqual(
+      result.targets.map((t) => t.target),
+      renamed.map((agent) => agent.name),
+    )
+    for (const agent of renamed) {
+      const restored = await readFile(
+        join(agent.getDir(), namedSlug, 'SKILL.md'),
+        'utf-8',
+      )
+      assert.equal(restored, 'restored content', agent.name)
+    }
   })
 })

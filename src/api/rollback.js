@@ -2,7 +2,6 @@ import { join } from 'node:path'
 import { mkdir, writeFile, rm } from 'node:fs/promises'
 import {
   readLock,
-  writeLock,
   getGlobalLockPath,
   getProjectLockPath,
   getSkillHistory,
@@ -14,7 +13,7 @@ import {
   removeLatestBackup,
   assertSafeSlug,
 } from '../utils/installer.js'
-import { getAgentByFlag } from '../agents.js'
+import agents, { getAgentByFlag } from '../agents.js'
 import { UserError } from '../utils/errors.js'
 
 export async function apiRollback(slug, options = {}) {
@@ -74,24 +73,24 @@ export async function apiRollback(slug, options = {}) {
     })
   }
 
+  if (dryRun) {
+    // A preview must not write the lockfile. history is newest-first, so its
+    // first entry is the one a real rollback would pop.
+    return {
+      dryRun: true,
+      slug,
+      files: Object.keys(backupData),
+      targets: existing.agents || [],
+      prevContentSha: history[0].contentSha?.slice(0, 12),
+    }
+  }
+
   // Pop history entry from lockfile
   const prevEntry = await popHistory(slug, lockPath)
   if (!prevEntry) {
     throw new UserError(`Failed to pop history for "${slug}".`, {
       code: 'ROLLBACK_POP_FAILED',
     })
-  }
-
-  if (dryRun) {
-    // Re-push the history entry since we popped it in dry-run
-    await addHistoryBack(slug, prevEntry, lockPath)
-    return {
-      dryRun: true,
-      slug,
-      files: Object.keys(backupData),
-      targets: existing.agents || [],
-      prevContentSha: prevEntry.contentSha?.slice(0, 12),
-    }
   }
 
   // Restore files to each install target
@@ -103,7 +102,9 @@ export async function apiRollback(slug, options = {}) {
     if (target === 'project') {
       baseDir = join(process.cwd(), '.agents', 'skills')
     } else {
-      const agent = getAgentByFlag(target)
+      // The lockfile records agent names (claude-code), not flags (claude).
+      const agent =
+        getAgentByFlag(target) || agents.find((a) => a.name === target)
       if (!agent) continue
       baseDir = agent.getDir()
     }
@@ -129,12 +130,4 @@ export async function apiRollback(slug, options = {}) {
     targets: results,
     prevContentSha: prevEntry.contentSha?.slice(0, 12),
   }
-}
-
-async function addHistoryBack(slug, entry, lockPath) {
-  const lock = await readLock(lockPath)
-  if (!lock.skills[slug]) return
-  if (!lock.skills[slug].history) lock.skills[slug].history = []
-  lock.skills[slug].history.push(entry)
-  await writeLock(lock, lockPath)
 }

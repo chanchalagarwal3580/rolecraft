@@ -8,6 +8,8 @@ import {
   applyProfileData,
   validateProfile,
 } from '../utils/profile.js'
+import { UserError } from '../utils/errors.js'
+import { fetchFollowingRedirects } from '../utils/http-fetch.js'
 
 export async function apiProfileSave(name, options = {}) {
   let agentsData
@@ -59,6 +61,7 @@ export async function apiProfileApply(name, options = {}) {
     targets: options.targets,
     skipMcp: options.skipMcp,
     skipSkills: options.skipSkills,
+    yes: options.yes,
   })
   return { name, results }
 }
@@ -134,6 +137,53 @@ const ALLOWED_PROFILE_HOSTS = [
   'raw.gist.github.com',
 ]
 
+/**
+ * Maximum number of redirect hops to follow when importing a profile.
+ */
+const MAX_PROFILE_REDIRECTS = 3
+
+function assertAllowedProfileHost(url) {
+  const { hostname } = new URL(url)
+
+  if (!ALLOWED_PROFILE_HOSTS.includes(hostname)) {
+    throw new UserError(
+      `URL host "${hostname}" is not allowed for profile imports. ` +
+        `Allowed hosts: ${ALLOWED_PROFILE_HOSTS.join(', ')}`,
+      {
+        suggestion: 'Use a direct link to a raw file on an allowed host.',
+        code: 'PROFILE_HOST_NOT_ALLOWED',
+      },
+    )
+  }
+}
+
+/**
+ * Fetch a profile body, following redirects by hand.
+ *
+ * `redirect: 'follow'` would let any allowed host bounce the request to an
+ * arbitrary origin, so the allow-list has to be re-checked on every hop rather
+ * than only on the URL the user supplied. The loop itself lives in
+ * `utils/http-fetch.js` so the npm tarball download can share it instead of
+ * growing a second copy.
+ */
+async function fetchProfileBody(url) {
+  const { response, url: finalUrl } = await fetchFollowingRedirects(url, {
+    assertAllowed: assertAllowedProfileHost,
+    maxRedirects: MAX_PROFILE_REDIRECTS,
+    subject: `importing profile from ${url}`,
+    codeBase: 'PROFILE_REDIRECT',
+    suggestion: 'Use a direct link to the raw profile file.',
+  })
+
+  if (!response.ok) {
+    throw new UserError(`Failed to fetch ${finalUrl}: ${response.status}`, {
+      code: 'PROFILE_FETCH_FAILED',
+    })
+  }
+
+  return response.text()
+}
+
 export async function apiProfileImport(path) {
   const { readFile } = await import('node:fs/promises')
   const { resolve } = await import('node:path')
@@ -149,16 +199,7 @@ export async function apiProfileImport(path) {
   let data
   const isUrl = path.startsWith('http://') || path.startsWith('https://')
   if (isUrl) {
-    const parsedUrl = new URL(path)
-    if (!ALLOWED_PROFILE_HOSTS.includes(parsedUrl.hostname)) {
-      throw new Error(
-        `URL host "${parsedUrl.hostname}" is not allowed for profile imports. ` +
-          `Allowed hosts: ${ALLOWED_PROFILE_HOSTS.join(', ')}`,
-      )
-    }
-    const res = await fetch(path)
-    if (!res.ok) throw new Error(`Failed to fetch ${path}: ${res.status}`)
-    data = parseProfileJSON(await res.text())
+    data = parseProfileJSON(await fetchProfileBody(path))
   } else {
     data = parseProfileJSON(await readFile(resolve(path), 'utf-8'))
   }

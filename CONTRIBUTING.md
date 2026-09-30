@@ -9,7 +9,7 @@ git clone https://github.com/rolecraft-sh/rolecraft.git
 cd rolecraft
 npm install              # also installs the pre-commit hook automatically
 npm link                 # now `rolecraft` runs from your local checkout
-npm test                 # 1031+ tests should pass
+npm test                 # 1164+ tests should pass
 ```
 
 **Requirements:** Node.js >= 20. Dev dependencies (Biome, VitePress) install locally but never ship to users — the runtime stays zero-dependency.
@@ -80,6 +80,8 @@ fix: correct bug in parser
 docs: update installation guide
 chore: bump dependencies
 ```
+
+Once your PR is merged, its title becomes a line in the next release's changelog credited to you, and you appear in that release's Contributors list. Nothing extra to do — squash-merge is the default here, and GitHub records you as the commit author.
 
 ## Open a Pull Request
 

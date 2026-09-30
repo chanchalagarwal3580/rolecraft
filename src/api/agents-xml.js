@@ -6,6 +6,8 @@ import {
   getAgentsDir,
   normalizeSlug,
 } from '../utils/lockfile.js'
+import { assertSafeSlug } from '../utils/installer.js'
+import { UserError } from '../utils/errors.js'
 
 const SKILLS_SYSTEM_HEADER = `Only use skills listed in <available_skills> below.
 Do not invoke a skill that is already loaded in your context.`
@@ -52,17 +54,30 @@ async function generateXml(allSkills) {
   if (entries.length === 0) return ''
 
   const skillsXml = await Promise.all(
-    entries.map(async ([, entry]) => {
-      const normSlug = normalizeSlug(entry.slug)
+    entries.map(async ([lockSlug, entry]) => {
+      const slug = entry.slug || lockSlug
+      const normSlug = normalizeSlug(slug)
       const searchDirs = [
-        join(getAgentsDir(), normSlug),
-        join(process.cwd(), '.agents', 'skills', normSlug),
+        { baseDir: getAgentsDir(), dir: join(getAgentsDir(), normSlug) },
+        {
+          baseDir: join(process.cwd(), '.agents', 'skills'),
+          dir: join(process.cwd(), '.agents', 'skills', normSlug),
+        },
       ]
 
       let existingDir = null
-      for (const d of searchDirs) {
-        if (await dirExists(d)) {
-          existingDir = d
+      for (const { baseDir, dir } of searchDirs) {
+        try {
+          assertSafeSlug(slug, baseDir, join(baseDir, slug))
+          assertSafeSlug(slug, baseDir, dir)
+        } catch (err) {
+          if (err instanceof UserError && err.userCode === 'UNSAFE_SLUG') {
+            return null
+          }
+          throw err
+        }
+        if (await dirExists(dir)) {
+          existingDir = dir
           break
         }
       }
@@ -82,11 +97,14 @@ async function generateXml(allSkills) {
     }),
   )
 
+  const included = skillsXml.filter(Boolean)
+  if (included.length === 0) return ''
+
   return `<skills_system>
 ${SKILLS_SYSTEM_HEADER}
 
 <available_skills>
-${skillsXml.join('\n')}
+${included.join('\n')}
 </available_skills>
 </skills_system>\n`
 }

@@ -1,6 +1,6 @@
 import { describe, it, before, after } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtempSync, writeFileSync } from 'node:fs'
+import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs'
 import { mkdir, rm, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
@@ -120,6 +120,68 @@ describe('api install', () => {
       }),
       /already installed/,
     )
+  })
+
+  it('rejects slugs that normalize to an installed directory', async () => {
+    const firstSkillDir = join(tempDir, 'test-skills', 'first-colliding-skill')
+    await mkdir(firstSkillDir, { recursive: true })
+    await writeFile(
+      join(firstSkillDir, 'SKILL.md'),
+      createSkill({
+        name: 'foo-bar',
+        slug: 'acme/foo-bar',
+        content: 'first install',
+      }),
+    )
+
+    await apiInstallSkills(firstSkillDir, {
+      cwd: tempDir,
+      scope: { project: true },
+      yes: true,
+    })
+
+    const installedPath = join(
+      tempDir,
+      '.agents',
+      'skills',
+      'acme-foo-bar',
+      'SKILL.md',
+    )
+    const installedBefore = readFileSync(installedPath, 'utf-8')
+    const lockPath = join(tempDir, '.agents', '.skill-lock.json')
+    const lockBefore = JSON.parse(readFileSync(lockPath, 'utf-8'))
+
+    const secondSkillDir = join(
+      tempDir,
+      'test-skills',
+      'second-colliding-skill',
+    )
+    await mkdir(secondSkillDir, { recursive: true })
+    await writeFile(
+      join(secondSkillDir, 'SKILL.md'),
+      createSkill({
+        name: 'foo-bar',
+        slug: 'acme-foo-bar',
+        content: 'second install',
+      }),
+    )
+
+    await assert.rejects(
+      apiInstallSkills(secondSkillDir, {
+        cwd: tempDir,
+        scope: { project: true },
+        yes: true,
+      }),
+      (error) => {
+        assert.equal(error.userCode, 'SLUG_COLLISION')
+        assert.match(error.message, /acme\/foo-bar/)
+        assert.match(error.message, /acme-foo-bar/)
+        return true
+      },
+    )
+
+    assert.equal(readFileSync(installedPath, 'utf-8'), installedBefore)
+    assert.deepEqual(JSON.parse(readFileSync(lockPath, 'utf-8')), lockBefore)
   })
 
   it('installs MCP servers from skill', async () => {

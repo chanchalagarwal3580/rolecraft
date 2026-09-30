@@ -16,7 +16,9 @@ import {
   getGlobalLockPath,
   getProjectLockPath,
   computeFileHashes,
+  getDirForAgent,
   normalizeSlug,
+  readLock,
 } from './lockfile.js'
 import { getAgentByFlag } from '../agents.js'
 
@@ -142,8 +144,55 @@ export async function removeLatestBackup(slug) {
   await rm(backups[0].path, { force: true }).catch(() => {})
 }
 
-export async function installSkill(resolved, targets, mode = 'copy') {
+function getTargetSkillDir(target, cwd) {
+  return target === 'project'
+    ? join(cwd, '.agents', 'skills')
+    : getDirForAgent(target)
+}
+
+async function assertNoSlugCollision(slug, targets, cwd = process.cwd()) {
+  const normalizedSlug = normalizeSlug(slug)
+  const targetSkillDirs = new Set(
+    targets.map((target) => getTargetSkillDir(target, cwd)),
+  )
+  const lockPaths = new Set(
+    targets.map((target) =>
+      target === 'project' ? getProjectLockPath(cwd) : getGlobalLockPath(),
+    ),
+  )
+
+  for (const lockPath of lockPaths) {
+    const lock = await readLock(lockPath)
+
+    for (const [entry, value] of Object.entries(lock.skills || {})) {
+      if (entry === slug || normalizeSlug(entry) !== normalizedSlug) continue
+
+      const existingAgentNames = value?.agents
+      const overlapsTarget = existingAgentNames?.some((agentName) =>
+        targetSkillDirs.has(getTargetSkillDir(agentName, cwd)),
+      )
+
+      if (existingAgentNames?.length && !overlapsTarget) continue
+
+      throw new UserError(
+        `Cannot install "${slug}": it conflicts with existing slug "${entry}" because both map to the same install directory.`,
+        {
+          suggestion: 'Remove the existing skill before installing this slug.',
+          code: 'SLUG_COLLISION',
+        },
+      )
+    }
+  }
+}
+
+export async function installSkill(
+  resolved,
+  targets,
+  mode = 'copy',
+  cwd = process.cwd(),
+) {
   const slug = resolved.slug
+  await assertNoSlugCollision(slug, targets, cwd)
 
   const agentNames = targets.map((target) => {
     const agent = getAgentByFlag(target)
@@ -160,7 +209,7 @@ export async function installSkill(resolved, targets, mode = 'copy') {
     let label
 
     if (target === 'project') {
-      baseDir = join(process.cwd(), '.agents', 'skills')
+      baseDir = join(cwd, '.agents', 'skills')
 
       label = './.agents/skills/'
     } else {
@@ -251,9 +300,7 @@ export async function installSkill(resolved, targets, mode = 'copy') {
     }
 
     const lockPath =
-      target === 'project'
-        ? getProjectLockPath(process.cwd())
-        : getGlobalLockPath()
+      target === 'project' ? getProjectLockPath(cwd) : getGlobalLockPath()
 
     await addSkillToLock(
       slug,

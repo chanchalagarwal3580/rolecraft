@@ -1,6 +1,6 @@
 import { describe, it, before, beforeEach, after } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtempSync, existsSync } from 'node:fs'
+import { mkdtempSync, existsSync, realpathSync } from 'node:fs'
 import { mkdir, rm, writeFile, readFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
@@ -184,7 +184,7 @@ describe('agentsXmlApi', () => {
     const result = await agentsXmlApi(true)
 
     assert.equal(result.written, true)
-    assert.equal(result.path, join(projectDir, 'AGENTS.md'))
+    assert.equal(result.path, realpathSync(join(projectDir, 'AGENTS.md')))
 
     const written = await readFile(join(projectDir, 'AGENTS.md'), 'utf-8')
     assert.ok(!written.includes('STALE'))
@@ -210,5 +210,34 @@ describe('agentsXmlApi', () => {
     assert.equal(result.written, true)
     const written = await readFile(join(projectDir, 'AGENTS.md'), 'utf-8')
     assert.equal(written, result.xml)
+  })
+
+  // The other half of #333: agents-xml walks the same lockfile and builds the
+  // same paths, so it needs its own guard. ".." is the form that survives
+  // normalizeSlug and still leaves the skills directory.
+  it('does not read outside the skills directory for a traversal slug', async () => {
+    const marker = 'should-not-be-read-4b71'
+    await mkdir(join(projectDir, '.agents', 'skills'), { recursive: true })
+    // agents-xml reads name/description out of SKILL.md in whatever directory
+    // it lands on, so the traversal target needs a real SKILL.md for the leak
+    // to be observable at all.
+    await writeFile(
+      join(projectDir, '.agents', 'SKILL.md'),
+      `---\nname: pwned\ndescription: ${marker}\n---\n\nBody\n`,
+    )
+    await writeLock(projectDir, {
+      '..': {
+        slug: '..',
+        agents: ['project'],
+        source: 'evil/repo',
+        sourceType: 'github',
+        installedAt: new Date().toISOString(),
+      },
+    })
+
+    const result = await agentsXmlApi(true)
+
+    assert.equal(result.xml.includes(marker), false)
+    assert.equal(result.xml.includes('should-not-be-read'), false)
   })
 })

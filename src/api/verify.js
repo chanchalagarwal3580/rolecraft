@@ -9,6 +9,8 @@ import { readFile, readdir } from 'node:fs/promises'
 import { join } from 'node:path'
 import { createHash } from 'node:crypto'
 import agents from '../agents.js'
+import { assertSafeSlug } from '../utils/installer.js'
+import { UserError } from '../utils/errors.js'
 
 const agentDirMap = Object.fromEntries(agents.map((a) => [a.name, a.getDir]))
 
@@ -77,19 +79,52 @@ export async function apiVerify(cwd = process.cwd(), frozen = false) {
     }
 
     const normSlug = normalizeSlug(slug)
-    const dirsToCheck = (entry.agents || [])
+    const candidateDirs = (entry.agents || [])
       .map((name) => {
-        if (name === 'project') return join(cwd, '.agents', 'skills', normSlug)
+        if (name === 'project') {
+          return {
+            baseDir: join(cwd, '.agents', 'skills'),
+            dir: join(cwd, '.agents', 'skills', normSlug),
+          }
+        }
         const dirFn = agentDirMap[name]
-        return dirFn ? join(dirFn(), normSlug) : null
+        return dirFn ? { baseDir: dirFn(), dir: join(dirFn(), normSlug) } : null
       })
       .filter(Boolean)
 
-    if (dirsToCheck.length === 0) {
-      dirsToCheck.push(
-        join(getAgentsDir(), normSlug),
-        join(cwd, '.agents', 'skills', normSlug),
+    if (candidateDirs.length === 0) {
+      candidateDirs.push(
+        { baseDir: getAgentsDir(), dir: join(getAgentsDir(), normSlug) },
+        {
+          baseDir: join(cwd, '.agents', 'skills'),
+          dir: join(cwd, '.agents', 'skills', normSlug),
+        },
       )
+    }
+
+    let unsafeSlug = false
+    const dirsToCheck = []
+    for (const { baseDir, dir } of candidateDirs) {
+      try {
+        assertSafeSlug(slug, baseDir, join(baseDir, slug))
+        assertSafeSlug(slug, baseDir, dir)
+        dirsToCheck.push(dir)
+      } catch (err) {
+        if (err instanceof UserError && err.userCode === 'UNSAFE_SLUG') {
+          unsafeSlug = true
+          break
+        }
+        throw err
+      }
+    }
+
+    if (unsafeSlug) {
+      failed.push({
+        slug,
+        reason: `unsafe slug: refusing path traversal for "${slug}"`,
+      })
+      allPassed = false
+      continue
     }
 
     let foundAny = false

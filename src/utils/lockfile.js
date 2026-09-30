@@ -1,8 +1,16 @@
-import { mkdir, readFile, writeFile } from 'node:fs/promises'
-import { join, dirname } from 'node:path'
+import { readFile } from 'node:fs/promises'
+import { join } from 'node:path'
 import { createHash } from 'node:crypto'
-import { getAgentByFlag } from '../agents.js'
+import AGENTS_DATA, { getAgentByFlag } from '../agents.js'
 import { home } from './paths.js'
+import {
+  ensureParentDir,
+  updateLockFile,
+  writeJsonAtomic,
+  __testing as __testingLockWrite,
+} from './lock-write.js'
+
+export { ensureParentDir }
 
 const LOCKFILE_VERSION = 3
 
@@ -23,7 +31,7 @@ export function getAgentsDir() {
  * Falls back to ~/.agents/skills for unknown flags.
  */
 export function getDirForAgent(flag) {
-  const agent = getAgentByFlag(flag)
+  const agent = getAgentByFlag(flag) || AGENTS_DATA.find((a) => a.name === flag)
 
   if (agent) {
     return agent.getDir()
@@ -34,10 +42,6 @@ export function getDirForAgent(flag) {
 
 export function getProjectLockPath(cwd) {
   return join(cwd, '.agents', '.skill-lock.json')
-}
-
-export async function ensureParentDir(filePath) {
-  await mkdir(dirname(filePath), { recursive: true })
 }
 
 export async function readLock(lockPath = getGlobalLockPath()) {
@@ -54,10 +58,75 @@ export async function readLock(lockPath = getGlobalLockPath()) {
   }
 }
 
+/**
+ * Write the lock file atomically.
+ *
+ * The implementation is shared with the MCP lockfile, so both stop carrying
+ * their own copy of the temp-file-and-rename dance.
+ */
 export async function writeLock(data, lockPath = getGlobalLockPath()) {
-  await ensureParentDir(lockPath)
+  await writeJsonAtomic(lockPath, data)
+}
 
-  await writeFile(lockPath, `${JSON.stringify(data, null, 2)}\n`, 'utf-8')
+/**
+ * Read the lock file for an update, tolerating a missing or unreadable file.
+ *
+ * Mirrors `readLock`, which is deliberately not reused so the two stay
+ * independent: a reader should never be able to block or fail a writer.
+ */
+async function readLockForUpdate(lockPath) {
+  let raw
+
+  try {
+    raw = await readFile(lockPath, 'utf-8')
+  } catch {
+    raw = null
+  }
+
+  let lock
+  try {
+    // JSON.parse(null) coerces to the string "null" and returns null rather
+    // than throwing, so a missing file has to be handled explicitly.
+    lock = raw === null ? null : JSON.parse(raw)
+  } catch {
+    lock = null
+  }
+
+  if (!lock || typeof lock !== 'object') {
+    // Matches readLock: an unreadable file reads as an empty lock.
+    lock = {
+      version: LOCKFILE_VERSION,
+      skills: {},
+      dismissed: {},
+      lastSelectedAgents: [],
+    }
+  }
+
+  return lock
+}
+
+/**
+ * Apply `mutate` to the skill lock file under an exclusive lock.
+ *
+ * Every mutation in this module is a read-modify-write, and the rename in
+ * `writeLock` is last-writer-wins. Without a guard, two installs that read the
+ * same lock and each add a different skill both write, and the second rename
+ * discards the first. The result parses cleanly and is silently missing an
+ * entry, which is why the atomicity fix alone does not cover this.
+ *
+ * `mutate` must be a pure function of the lock returning a new lock rather than
+ * mutating in place. That keeps the three helpers below symmetrical and makes
+ * each one independently testable.
+ *
+ * The guard itself is shared with the MCP lockfile, which had the same two
+ * problems, so it lives in `lock-write.js` rather than here.
+ */
+function updateLock(lockPath, mutate) {
+  return updateLockFile(lockPath, {
+    read: readLockForUpdate,
+    write: writeLock,
+    mutate,
+  })
 }
 
 /**
@@ -103,27 +172,26 @@ export async function addSkillToLock(
   entry,
   lockPath = getGlobalLockPath(),
 ) {
-  const lock = await readLock(lockPath)
-  const existing = lock.skills[slug]
+  return updateLock(lockPath, (lock) => {
+    const existing = lock.skills[slug]
 
-  const mergedAgents = existing?.agents
-    ? [...new Set([...existing.agents, ...(entry.agents || [])])]
-    : entry.agents || []
+    const mergedAgents = existing?.agents
+      ? [...new Set([...existing.agents, ...(entry.agents || [])])]
+      : entry.agents || []
 
-  pushHistory(lock, slug, entry)
+    pushHistory(lock, slug, entry)
 
-  const history = lock.skills[slug]?.history || []
+    const history = lock.skills[slug]?.history || []
 
-  lock.skills[slug] = {
-    ...entry,
-    agents: mergedAgents,
-    installedAt: new Date().toISOString(),
-    history,
-  }
+    lock.skills[slug] = {
+      ...entry,
+      agents: mergedAgents,
+      installedAt: new Date().toISOString(),
+      history,
+    }
 
-  await writeLock(lock, lockPath)
-
-  return lock
+    return lock
+  })
 }
 
 /**
@@ -147,37 +215,66 @@ export async function getSkillHistory(slug, lockPath = getGlobalLockPath()) {
  * Returns the restored entry data, or null if no history exists.
  */
 export async function popHistory(slug, lockPath = getGlobalLockPath()) {
-  const lock = await readLock(lockPath)
-  const entry = lock.skills[slug]
+  // Cheap pre-check for the common no-op case, so rolling back a skill that
+  // was never updated does not take the cross-process lock at all. That path
+  // is reached on every rollback attempt, including ones with nothing to undo,
+  // and acquiring a contended lock for a read we already know is pointless
+  // turns a free operation into one that can wait out the timeout.
+  //
+  // This is advisory only. The read is deliberately not locked, so it can go
+  // stale, and another process may add history between here and the mutation
+  // below. The locked mutation re-checks and remains the only thing that
+  // decides, so a wrong answer here costs a wasted lock, never a lost update.
+  const snapshot = await readLock(lockPath)
 
-  if (!entry?.history || entry.history.length === 0) {
+  if (!snapshot.skills[slug]?.history?.length) {
     return null
   }
 
-  const prev = entry.history.pop()
+  // The mutation returns the entry that was rolled back to, which is not part
+  // of the lock itself, so it is captured out of band. A retry re-applies the
+  // pop to a fresh snapshot, so each attempt still rolls back exactly one
+  // version rather than compounding.
+  let popped = null
 
-  lock.skills[slug].contentSha = prev.contentSha
-  lock.skills[slug].fileHashes = prev.fileHashes
-  lock.skills[slug].installedAt = prev.installedAt
-  lock.skills[slug].source = prev.source
-  lock.skills[slug].sourceType = prev.sourceType
+  await updateLock(lockPath, (current) => {
+    const entry = current.skills[slug]
 
-  await writeLock(lock, lockPath)
+    if (!entry?.history || entry.history.length === 0) {
+      popped = null
+      return current
+    }
 
-  return prev
+    const prev = entry.history.pop()
+
+    current.skills[slug].contentSha = prev.contentSha
+    current.skills[slug].fileHashes = prev.fileHashes
+    current.skills[slug].installedAt = prev.installedAt
+    current.skills[slug].source = prev.source
+    current.skills[slug].sourceType = prev.sourceType
+
+    popped = prev
+
+    return current
+  })
+
+  // No history to roll back, so nothing was written and the caller sees null.
+  if (popped === null) {
+    return null
+  }
+
+  return popped
 }
 
 export async function removeSkillFromLock(
   slug,
   lockPath = getGlobalLockPath(),
 ) {
-  const lock = await readLock(lockPath)
+  return updateLock(lockPath, (lock) => {
+    delete lock.skills[slug]
 
-  delete lock.skills[slug]
-
-  await writeLock(lock, lockPath)
-
-  return lock
+    return lock
+  })
 }
 
 export function findActualSlug(slug, lock) {
@@ -214,3 +311,12 @@ export function computeFileHashes(fileContents) {
 
   return hashes
 }
+
+/**
+ * Exposed for tests only.
+ *
+ * The timeout is the one failure mode of the update lock a user can actually
+ * reach, so it needs coverage. Threading a timeout through the three public
+ * helpers would put a test concern in the public API, so it lives here instead.
+ */
+export const __testing = __testingLockWrite
