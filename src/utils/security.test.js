@@ -485,22 +485,37 @@ describe('security', () => {
       )
     })
 
-    it('adds low severity warning for npm source', () => {
+    it('requires review when npm package contents are unavailable', () => {
       const result = scanMcpServer({
         sourceType: 'npm',
         packageName: '@modelcontextprotocol/github',
       })
-      assert.equal(result.score, 99)
+      assert.equal(result.score, 89)
       assert.ok(result.issues.some((i) => i.category === 'source_type'))
+      assert.ok(result.issues.some((i) => i.category === 'unscanned_source'))
+      assert.equal(classifyScore(result.score, result.issues), 'review')
     })
 
-    it('returns score 99 for npm source with source warning', () => {
+    it('requires review when npm package contents are empty', () => {
       const result = scanMcpServer({
         sourceType: 'npm',
         packageName: '@modelcontextprotocol/github',
+        fileContents: {},
+      })
+      assert.ok(result.issues.some((i) => i.category === 'unscanned_source'))
+      assert.equal(classifyScore(result.score, result.issues), 'review')
+    })
+
+    it('does not flag npm contents as unscanned when source files are available', () => {
+      const result = scanMcpServer({
+        sourceType: 'npm',
+        fileContents: { 'index.js': 'console.log("hello")' },
       })
       assert.equal(result.score, 99)
-      assert.ok(result.issues.length > 0)
+      assert.equal(
+        result.issues.some((issue) => issue.category === 'unscanned_source'),
+        false,
+      )
     })
 
     it('handles missing fileContents gracefully', () => {

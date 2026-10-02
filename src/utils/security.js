@@ -235,6 +235,14 @@ export function classifyScore(score, issues = []) {
   return 'danger'
 }
 
+// Preserve scanned-source policy while requiring approval for unscanned npm.
+export function requiresMcpApproval({ score, issues }) {
+  return (
+    classifyScore(score, issues) === 'danger' ||
+    issues.some((issue) => issue.category === 'unscanned_source')
+  )
+}
+
 export function scanMcpServer(resolved) {
   const issues = []
 
@@ -278,6 +286,17 @@ export function scanMcpServer(resolved) {
   }
 
   if (resolved.sourceType === 'npm') {
+    const hasScannableContents = Object.values(
+      resolved.fileContents || {},
+    ).some((content) => typeof content === 'string')
+    if (!hasScannableContents) {
+      issues.push({
+        severity: 'high',
+        category: 'unscanned_source',
+        description:
+          'npm package contents were not available for security scanning',
+      })
+    }
     issues.push({
       severity: 'low',
       category: 'source_type',
